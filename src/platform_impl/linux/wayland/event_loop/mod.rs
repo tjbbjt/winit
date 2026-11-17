@@ -7,7 +7,7 @@ use std::mem;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -77,6 +77,9 @@ pub struct EventLoop<T: 'static> {
     event_loop: calloop::EventLoop<'static, WinitState>,
 
     pump_event_notifier: Option<PumpEventNotifier>,
+
+    /// Reads the connection while this thread is busy in a callback.
+    busy_reader: BusyReader,
 }
 
 impl<T: 'static> EventLoop<T> {
@@ -164,7 +167,10 @@ impl<T: 'static> EventLoop<T> {
             state: RefCell::new(winit_state),
         };
 
+        let busy_reader = BusyReader::spawn(connection.clone());
+
         let event_loop = Self {
+            busy_reader,
             loop_running: false,
             compositor_updates: Vec::new(),
             buffer_sink: EventSink::default(),
@@ -219,6 +225,7 @@ impl<T: 'static> EventLoop<T> {
             self.loop_running = true;
 
             // Run the initial loop iteration.
+            self.busy_reader.busy();
             self.single_iteration(&mut callback, StartCause::Init);
         }
 
@@ -288,7 +295,10 @@ impl<T: 'static> EventLoop<T> {
                 return;
             }
 
-            if let Err(error) = self.loop_dispatch(timeout) {
+            self.busy_reader.idle();
+            let dispatched = self.loop_dispatch(timeout);
+            self.busy_reader.busy();
+            if let Err(error) = dispatched {
                 // NOTE We exit on errors from dispatches, since if we've got protocol error
                 // libwayland-client/wayland-rs will inform us anyway, but crashing downstream is
                 // not really an option. Instead we inform that the event loop got
@@ -837,6 +847,117 @@ impl PumpEventNotifier {
         }
 
         PumpEventNotifier { control, handle: handle.ok(), worker_waker: Some(write) }
+    }
+}
+
+/// How long the loop's thread runs callbacks before [`BusyReader`] reads for it.
+const BUSY_READ_AFTER_MS: u64 = 200;
+
+/// Reads the Wayland connection while the event loop's thread is busy in a callback (an
+/// application drawing a frame that takes a second or two, say), without dispatching: the events
+/// are queued and dispatched in order once the loop polls again. A compositor disconnects a client
+/// whose buffer of unread events fills up ("Broken pipe"), and moving a high-rate mouse over a
+/// window whose thread is blocked fills it within about a second.
+struct BusyReader {
+    /// When the loop's thread last woke from polling, in milliseconds since `base` plus one; zero
+    /// while it polls (and reads the connection itself).
+    busy_since: Arc<AtomicU64>,
+    base: Instant,
+    worker_waker: Option<OwnedFd>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BusyReader {
+    fn spawn(connection: Connection) -> Self {
+        let base = Instant::now();
+        let busy_since = Arc::new(AtomicU64::new(0));
+        let (read, write) = match pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK) {
+            Ok((read, write)) => (read, write),
+            Err(_) => return Self { busy_since, base, worker_waker: None, handle: None },
+        };
+        let since = Arc::clone(&busy_since);
+        let handle = std::thread::Builder::new().name(String::from("wayland busy reader")).spawn(
+            move || {
+                // Reads during the current busy stretch, for the log line when it ends.
+                let mut reads = 0u32;
+                let mut stretch = 0u64;
+                loop {
+                    let started = since.load(Ordering::Acquire);
+                    let now = base.elapsed().as_millis() as u64 + 1;
+                    let busy = started != 0 && now.saturating_sub(started) >= BUSY_READ_AFTER_MS;
+                    if !busy && reads > 0 {
+                        tracing::info!(
+                            "wayland: read the connection {reads} times while the event loop was \
+                             busy for {} ms",
+                            now.saturating_sub(stretch)
+                        );
+                        reads = 0;
+                    }
+                    let guard = if busy { connection.prepare_read() } else { None };
+                    let stop = PollFd::from_borrowed_fd(read.as_fd(), PollFlags::IN);
+                    let ready = match &guard {
+                        Some(_) => {
+                            let wayland =
+                                PollFd::from_borrowed_fd(connection.as_fd(), PollFlags::IN);
+                            let mut fds = [stop, wayland];
+                            let _ = rustix::event::poll(&mut fds, 50);
+                            (
+                                fds[0].revents().contains(PollFlags::IN),
+                                fds[1].revents().contains(PollFlags::IN),
+                            )
+                        },
+                        None => {
+                            let mut fds = [stop];
+                            let _ = rustix::event::poll(&mut fds, 50);
+                            (fds[0].revents().contains(PollFlags::IN), false)
+                        },
+                    };
+                    if ready.0 {
+                        break;
+                    }
+                    match guard {
+                        // Queue what has arrived; the loop's thread dispatches it.
+                        Some(guard) if ready.1 => {
+                            if reads == 0 {
+                                stretch = started;
+                            }
+                            reads += 1;
+                            let _ = guard.read_without_dispatch();
+                        },
+                        // Dropping the guard cancels the read.
+                        _ => {},
+                    }
+                }
+            },
+        );
+
+        if let Some(err) = handle.as_ref().err() {
+            warn!("failed to spawn the Wayland busy reader thread: {err}");
+        }
+
+        BusyReader { busy_since, base, worker_waker: Some(write), handle: handle.ok() }
+    }
+
+    /// The loop's thread is about to poll the connection itself.
+    fn idle(&self) {
+        self.busy_since.store(0, Ordering::Release);
+    }
+
+    /// The loop's thread woke up and runs callbacks until it polls again.
+    fn busy(&self) {
+        let now = self.base.elapsed().as_millis() as u64 + 1;
+        self.busy_since.store(now, Ordering::Release);
+    }
+}
+
+impl Drop for BusyReader {
+    fn drop(&mut self) {
+        if let Some(worker_waker) = self.worker_waker.as_ref() {
+            let _ = rustix::io::write(worker_waker.as_fd(), &[0u8]);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
