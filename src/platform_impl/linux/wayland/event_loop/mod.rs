@@ -878,22 +878,38 @@ impl BusyReader {
         let since = Arc::clone(&busy_since);
         let handle = std::thread::Builder::new().name(String::from("wayland busy reader")).spawn(
             move || {
-                // Reads during the current busy stretch, for the log line when it ends.
-                let mut reads = 0u32;
+                // Reads during the current busy stretch (and reads it couldn't prepare), for the
+                // log lines.
+                let (mut reads, mut refused) = (0u32, 0u32);
                 let mut stretch = 0u64;
                 loop {
                     let started = since.load(Ordering::Acquire);
                     let now = base.elapsed().as_millis() as u64 + 1;
                     let busy = started != 0 && now.saturating_sub(started) >= BUSY_READ_AFTER_MS;
-                    if !busy && reads > 0 {
+                    if !busy && (reads > 0 || refused > 0) {
                         tracing::info!(
-                            "wayland: read the connection {reads} times while the event loop was \
-                             busy for {} ms",
+                            "wayland: read the connection {reads} times ({refused} refused) while \
+                             the event loop was busy for {} ms",
                             now.saturating_sub(stretch)
                         );
-                        reads = 0;
+                        (reads, refused) = (0, 0);
                     }
-                    let guard = if busy { connection.prepare_read() } else { None };
+                    // Events already read sit in the backend's own queue until they are moved
+                    // to their event queues, and while they do no read can be prepared: move them
+                    // (the queues' owners still dispatch them, on the loop's thread).
+                    let guard = if busy {
+                        let _ = connection.backend().dispatch_inner_queue();
+                        let guard = connection.prepare_read();
+                        if guard.is_none() {
+                            if reads == 0 && refused == 0 {
+                                stretch = started;
+                            }
+                            refused += 1;
+                        }
+                        guard
+                    } else {
+                        None
+                    };
                     let stop = PollFd::from_borrowed_fd(read.as_fd(), PollFlags::IN);
                     let ready = match &guard {
                         Some(_) => {
@@ -908,7 +924,7 @@ impl BusyReader {
                         },
                         None => {
                             let mut fds = [stop];
-                            let _ = rustix::event::poll(&mut fds, 50);
+                            let _ = rustix::event::poll(&mut fds, if busy { 5 } else { 50 });
                             (fds[0].revents().contains(PollFlags::IN), false)
                         },
                     };
@@ -918,11 +934,15 @@ impl BusyReader {
                     match guard {
                         // Queue what has arrived; the loop's thread dispatches it.
                         Some(guard) if ready.1 => {
-                            if reads == 0 {
+                            if reads == 0 && refused == 0 {
                                 stretch = started;
+                                tracing::info!(
+                                    "wayland: the event loop is busy, reading the connection for it"
+                                );
                             }
                             reads += 1;
                             let _ = guard.read_without_dispatch();
+                            let _ = connection.backend().dispatch_inner_queue();
                         },
                         // Dropping the guard cancels the read.
                         _ => {},
